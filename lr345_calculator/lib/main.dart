@@ -1,24 +1,69 @@
+import 'dart:io' show Platform;
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:sqflite/sqflite.dart';
+import 'package:path/path.dart' as p;
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
-void main() => runApp(const MyApp());
 
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // FFI нужен только на десктопе. На Android/iOS используется нативный sqflite.
+  if (Platform.isLinux || Platform.isWindows || Platform.isMacOS) {
+    sqfliteFfiInit();
+    databaseFactory = databaseFactoryFfi;
+  }
+
+  runApp(const MyApp());
+}
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Шушарев Вариант 9 — Cubit (смена состояний)',
-      home: BlocProvider(
-        create: (context) => MotionCubit(),
-        child: const MotionScreen(),
+    return MultiBlocProvider(
+      providers: [
+        BlocProvider(create: (context) => MotionCubit()),
+        BlocProvider(create: (context) => HistoryCubit()),
+      ],
+      child: MaterialApp(
+        title: 'Шушарев Вариант 9 — Cubit + SQLite + SharedPreferences',
+        home: const MotionScreen(),
       ),
     );
   }
 }
 
-// Состояния Cubit
+// ---------- Результат расчёта ----------
+class CalcResult {
+  CalcResult({this.id, required this.v1, required this.v2, required this.t});
+  final int? id;
+  final double v1;
+  final double v2;
+  final double t;
+  double get a => (v2 - v1) / t;
+  double get s => (v1 + v2) / 2 * t;
+  double get vAvg => (v1 + v2) / 2;
+}
+
+// ---------- SQLite ----------
+Future<Database> _db() async {
+  final path = p.join(await getDatabasesPath(), 'results.db');
+  final db = await openDatabase(path);
+  await db.execute(
+    'CREATE TABLE IF NOT EXISTS results ('
+    'id INTEGER PRIMARY KEY AUTOINCREMENT, '
+    'v1 REAL NOT NULL, '
+    'v2 REAL NOT NULL, '
+    't REAL NOT NULL, '
+    'created_at TEXT)',
+  );
+  return db;
+}
+
+// ---------- MotionCubit (ввод -> результат, сохраняет в БД) ----------
 abstract class MotionState {}
 
 class MotionInputState extends MotionState {
@@ -32,17 +77,67 @@ class MotionResultsState extends MotionState {
   final double t;
 }
 
-// Все вычисления живут в Cubit
 class MotionCubit extends Cubit<MotionState> {
   MotionCubit() : super(MotionInputState());
 
   void toInput() => emit(MotionInputState());
 
-  void toResults(double v1, double v2, double t) =>
-      emit(MotionResultsState(v1: v1, v2: v2, t: t));
+  Future<void> toResults(double v1, double v2, double t) async {
+    // Сохраняем расчёт в SQLite
+    final db = await _db();
+    await db.insert('results', {
+      'v1': v1,
+      'v2': v2,
+      't': t,
+      'created_at': DateTime.now().toIso8601String(),
+    });
+    await db.close();
+    emit(MotionResultsState(v1: v1, v2: v2, t: t));
+  }
 }
 
-// Один экран, но представление меняется по состоянию — вместо навигации
+// ---------- HistoryCubit (загружает историю из SQLite) ----------
+abstract class HistoryState {}
+
+class HistoryLoading extends HistoryState {
+  HistoryLoading();
+}
+
+class HistoryLoaded extends HistoryState {
+  HistoryLoaded(this.items);
+  final List<CalcResult> items;
+}
+
+class HistoryError extends HistoryState {
+  HistoryError(this.message);
+  final String message;
+}
+
+class HistoryCubit extends Cubit<HistoryState> {
+  HistoryCubit() : super(HistoryLoading());
+
+  Future<void> load() async {
+    emit(HistoryLoading());
+    try {
+      final db = await _db();
+      final rows = await db.query('results', orderBy: 'id DESC');
+      final items = rows
+          .map((m) => CalcResult(
+                id: m['id'] as int,
+                v1: (m['v1'] as num).toDouble(),
+                v2: (m['v2'] as num).toDouble(),
+                t: (m['t'] as num).toDouble(),
+              ))
+          .toList();
+      await db.close();
+      emit(HistoryLoaded(items));
+    } catch (e) {
+      emit(HistoryError('$e'));
+    }
+  }
+}
+
+// ---------- Главный экран (состояния, как в ЛР4) ----------
 class MotionScreen extends StatelessWidget {
   const MotionScreen({super.key});
 
@@ -50,7 +145,20 @@ class MotionScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Вариант 9: Cubit — смена состояний вместо экранов'),
+        title: const Text('Вариант 9: Cubit + SQLite'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.history),
+            tooltip: 'История расчётов',
+            onPressed: () {
+              context.read<HistoryCubit>().load();
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => const HistoryScreen()),
+              );
+            },
+          ),
+        ],
       ),
       body: BlocBuilder<MotionCubit, MotionState>(
         builder: (context, state) {
@@ -65,7 +173,7 @@ class MotionScreen extends StatelessWidget {
   }
 }
 
-// «Экран ввода» — на самом деле состояние
+// «Экран ввода» (состояние); SharedPreferences помнит согласие
 class _InputView extends StatefulWidget {
   const _InputView();
 
@@ -79,6 +187,22 @@ class _InputViewState extends State<_InputView> {
   final _t = TextEditingController();
   bool _agreed = false;
   final _formKey = GlobalKey<FormState>();
+
+  @override
+  void initState() {
+    super.initState();
+    // Восстанавливаем «согласие» из SharedPreferences
+    SharedPreferences.getInstance().then((prefs) {
+      final v = prefs.getBool('agreed') ?? false;
+      if (v != _agreed) setState(() => _agreed = v);
+    });
+  }
+
+  void _setAgreed(bool? v) {
+    final nv = v ?? false;
+    setState(() => _agreed = nv);
+    SharedPreferences.getInstance().then((prefs) => prefs.setBool('agreed', nv));
+  }
 
   void _next() {
     if (!_formKey.currentState!.validate()) return;
@@ -99,7 +223,7 @@ class _InputViewState extends State<_InputView> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             TextFormField(
-                            controller: _v1,
+              controller: _v1,
               keyboardType: TextInputType.number,
               decoration: const InputDecoration(
                 labelText: 'Начальная скорость v1, м/с',
@@ -114,7 +238,7 @@ class _InputViewState extends State<_InputView> {
             ),
             const SizedBox(height: 12),
             TextFormField(
-                            controller: _v2,
+              controller: _v2,
               keyboardType: TextInputType.number,
               decoration: const InputDecoration(
                 labelText: 'Конечная скорость v2, м/с',
@@ -129,7 +253,7 @@ class _InputViewState extends State<_InputView> {
             ),
             const SizedBox(height: 12),
             TextFormField(
-                            controller: _t,
+              controller: _t,
               keyboardType: TextInputType.number,
               decoration: const InputDecoration(
                 labelText: 'Время t, с',
@@ -147,12 +271,12 @@ class _InputViewState extends State<_InputView> {
             CheckboxListTile(
               value: _agreed,
               title: const Text('Я согласен предоставить данные для расчёта'),
-              onChanged: (v) => setState(() => _agreed = v ?? false),
+              onChanged: _setAgreed,
             ),
             const SizedBox(height: 8),
             ElevatedButton(
               onPressed: _agreed ? _next : null,
-              child: const Text('Дальше'),
+              child: const Text('Дальше (сохранить в БД)'),
             ),
           ],
         ),
@@ -161,7 +285,7 @@ class _InputViewState extends State<_InputView> {
   }
 }
 
-// «Экран результатов» — на самом деле состояние
+// «Экран результатов» (состояние)
 class _ResultsView extends StatelessWidget {
   const _ResultsView({required this.v1, required this.v2, required this.t});
   final double v1;
@@ -203,9 +327,54 @@ class _ResultsView extends StatelessWidget {
           const SizedBox(height: 16),
           ElevatedButton(
             onPressed: () => context.read<MotionCubit>().toInput(),
-            child: const Text('Назад (сменить состояние)'),
+            child: const Text('Новый расчёт (сменить состояние)'),
           ),
         ],
+      ),
+    );
+  }
+}
+
+// Экран истории (загружается из SQLite через HistoryCubit)
+class HistoryScreen extends StatefulWidget {
+  const HistoryScreen({super.key});
+
+  @override
+  State<HistoryScreen> createState() => _HistoryScreenState();
+}
+
+class _HistoryScreenState extends State<HistoryScreen> {
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('История расчётов')),
+      body: BlocBuilder<HistoryCubit, HistoryState>(
+        builder: (context, state) {
+          if (state is HistoryLoading) {
+            return const Center(child: CircularProgressIndicator());
+          }
+          if (state is HistoryError) {
+            return Center(child: Text('Ошибка: ${state.message}'));
+          }
+          final loaded = state as HistoryLoaded;
+          if (loaded.items.isEmpty) {
+            return const Center(child: Text('История пуста'));
+          }
+          return ListView.builder(
+            itemCount: loaded.items.length,
+            itemBuilder: (context, i) {
+              final r = loaded.items[i];
+              return ListTile(
+                title:
+                    Text('v1 = ${r.v1} м/с   v2 = ${r.v2} м/с   t = ${r.t} с'),
+                subtitle: Text(
+                    'a = ${r.a.toStringAsFixed(2)} м/с²   '
+                    's = ${r.s.toStringAsFixed(2)} м   '
+                    'v = ${r.vAvg.toStringAsFixed(2)} м/с'),
+              );
+            },
+          );
+        },
       ),
     );
   }
